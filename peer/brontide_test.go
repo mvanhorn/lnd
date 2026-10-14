@@ -3,6 +3,7 @@ package peer
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync/atomic"
@@ -20,6 +21,7 @@ import (
 	"github.com/lightningnetwork/lnd/contractcourt"
 	"github.com/lightningnetwork/lnd/fn/v2"
 	"github.com/lightningnetwork/lnd/htlcswitch"
+	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lnpeer"
 	"github.com/lightningnetwork/lnd/lntest/wait"
 	"github.com/lightningnetwork/lnd/lnwallet"
@@ -83,6 +85,64 @@ func TestPeerChannelClosureShutdownResponseLinkRemoved(t *testing.T) {
 	}
 
 	require.NotEqualValues(t, shutdownMsg.Address, dummyDeliveryScript)
+}
+
+// TestPeerChannelClosureRejectsDirtyChannelWithoutLink checks that a close
+// message is refused for a channel whose state is not clean, even with no link
+// present.
+func TestPeerChannelClosureRejectsDirtyChannelWithoutLink(t *testing.T) {
+	addHtlc := func(a, b *chanstate.OpenChannel) {
+		aliceCommit := a.LocalCommitment
+		aliceCommit.Htlcs = []chanstate.HTLC{{
+			Amt:           1_000_000,
+			RefundTimeout: 1000,
+			OutputIndex:   2,
+			Incoming:      false,
+		}}
+		a.LocalCommitment = aliceCommit
+		a.RemoteCommitment = aliceCommit
+
+		bobCommit := b.LocalCommitment
+		bobCommit.Htlcs = []chanstate.HTLC{{
+			Amt:           1_000_000,
+			RefundTimeout: 1000,
+			OutputIndex:   2,
+			Incoming:      true,
+		}}
+		b.LocalCommitment = bobCommit
+		b.RemoteCommitment = bobCommit
+	}
+
+	harness, err := createTestPeerWithChannel(t, addHtlc)
+	require.NoError(t, err)
+
+	peer := harness.peer
+	chanPoint := harness.channel.ChannelPoint()
+	chanID := lnwire.NewChanIDFromOutPoint(chanPoint)
+	require.Empty(t, harness.mockSwitch.links)
+
+	peer.chanCloseMsgs <- &closeMsg{
+		cid: chanID,
+		msg: lnwire.NewShutdown(
+			chanID, genScript(t, p2wshAddress),
+		),
+	}
+
+	select {
+	case <-peer.cg.Done():
+	case <-time.After(timeout):
+		t.Fatal("peer accepted a dirty channel without a link")
+	}
+
+	_, found := peer.activeChanCloses.Load(chanID)
+	require.False(t, found)
+
+	select {
+	case out := <-peer.outgoingQueue:
+		t.Fatalf("unexpected close message: %T", out.msg)
+
+	case <-time.After(shortTimeout):
+	}
 }
 
 // TestPeerChannelClosureAcceptFeeResponder tests the shutdown responder's
@@ -310,6 +370,178 @@ func TestPeerChannelClosureFlushDrivesNegotiation(t *testing.T) {
 
 	// Alice should be waiting in a goroutine for a confirmation.
 	notifier.ConfChan <- &chainntnfs.TxConfirmation{}
+}
+
+// TestLinkFailureRetiresRestoredLegacyCloser checks that a link failure also
+// retires a legacy closer restored after reconnect, and that a later close
+// message for that channel is not answered.
+func TestLinkFailureRetiresRestoredLegacyCloser(t *testing.T) {
+	const htlcAmt = btcutil.Amount(1_000_000)
+	htlcMsat := lnwire.NewMSatFromSatoshis(htlcAmt)
+
+	addHtlc := func(a, b *chanstate.OpenChannel) {
+		commitFee := lnwire.NewMSatFromSatoshis(
+			a.LocalCommitment.CommitFee,
+		)
+
+		aliceCommit := a.LocalCommitment
+		aliceCommit.LocalBalance -= htlcMsat + commitFee
+		aliceCommit.LocalHtlcIndex = 1
+		aliceCommit.LocalLogIndex = 1
+		aliceCommit.Htlcs = []chanstate.HTLC{{
+			Amt:           htlcMsat,
+			RefundTimeout: 1000,
+			OutputIndex:   2,
+			Incoming:      false,
+		}}
+		a.LocalCommitment = aliceCommit
+		a.RemoteCommitment = aliceCommit
+
+		bobCommit := b.LocalCommitment
+		bobCommit.RemoteBalance -= htlcMsat + commitFee
+		bobCommit.RemoteHtlcIndex = 1
+		bobCommit.RemoteLogIndex = 1
+		bobCommit.Htlcs = []chanstate.HTLC{{
+			Amt:           htlcMsat,
+			RefundTimeout: 1000,
+			OutputIndex:   2,
+			Incoming:      true,
+		}}
+		b.LocalCommitment = bobCommit
+		b.RemoteCommitment = bobCommit
+	}
+
+	harness, err := createTestPeerWithChannel(t, addHtlc)
+	require.NoError(t, err)
+
+	firstPeer := harness.peer
+	chanPoint := harness.channel.ChannelPoint()
+	chanID := lnwire.NewChanIDFromOutPoint(chanPoint)
+	firstLink := newDeferredFlushUpdateHandler(chanID)
+	harness.mockSwitch.links = append(harness.mockSwitch.links, firstLink)
+
+	// Start a legacy close so its shutdown information is persisted before
+	// the connection is torn down.
+	closeReq := &htlcswitch.ChanClose{
+		CloseType:      contractcourt.CloseRegular,
+		ChanPoint:      &chanPoint,
+		Updates:        make(chan interface{}, 1),
+		TargetFeePerKw: 12500,
+		Err:            make(chan error, 1),
+	}
+	firstPeer.localCloseChanReqs <- closeReq
+
+	select {
+	case out := <-firstPeer.outgoingQueue:
+		_, ok := out.msg.(*lnwire.Shutdown)
+		require.True(t, ok, "expected Shutdown, got %T", out.msg)
+
+	case <-time.After(timeout):
+		t.Fatal("initial peer did not send Shutdown")
+	}
+
+	firstPeer.Disconnect(errors.New("test reconnect"))
+	firstPeer.cg.WgWait()
+
+	// Rebuild the channel and closer from the persisted channel state. This
+	// mirrors a new peer connection restoring an interrupted legacy close.
+	dbChans, err := firstPeer.cfg.ChannelDB.FetchOpenChannels(
+		firstPeer.cfg.Addr.IdentityKey,
+	)
+	require.NoError(t, err)
+	require.Len(t, dbChans, 1)
+	require.NotNil(t, harness.privKey)
+
+	signer := input.NewMockSigner(
+		[]*btcec.PrivateKey{harness.privKey}, nil,
+	)
+	sigPool := lnwallet.NewSigPool(1, signer)
+	require.NoError(t, sigPool.Start())
+	t.Cleanup(func() {
+		require.NoError(t, sigPool.Stop())
+	})
+
+	restoredChan, err := lnwallet.NewLightningChannel(
+		signer, dbChans[0], sigPool,
+		lnwallet.WithLeafStore(&lnwallet.MockAuxLeafStore{}),
+		lnwallet.WithAuxSigner(lnwallet.NewAuxSignerMock(
+			lnwallet.EmptyMockJobHandler,
+		)),
+	)
+	require.NoError(t, err)
+	require.Len(t, restoredChan.ActiveHtlcs(), 1)
+
+	reconnectedPeer := NewBrontide(firstPeer.cfg)
+	reconnectedPeer.remoteFeatures = lnwire.EmptyFeatureVector()
+	reconnectedPeer.storeActiveChannel(chanID, restoredChan)
+
+	restoredShutdown, err := reconnectedPeer.restartCoopClose(restoredChan)
+	require.NoError(t, err)
+	require.NotNil(t, restoredShutdown)
+	_, ok := reconnectedPeer.activeChanCloses.Load(chanID)
+	require.True(t, ok, "legacy closer was not restored")
+
+	reconnectedLink := newDeferredFlushUpdateHandler(chanID)
+	harness.mockSwitch.links = []htlcswitch.ChannelUpdateHandler{
+		reconnectedLink,
+	}
+
+	reconnectedPeer.cg.WgAdd(1)
+	go reconnectedPeer.channelManager()
+	t.Cleanup(func() {
+		reconnectedPeer.Disconnect(errors.New("test complete"))
+		reconnectedPeer.cg.WgWait()
+	})
+
+	// A non-disconnecting link failure removes the channel and link. It
+	// must also remove the restored closer before another close message can
+	// be processed.
+	reconnectedPeer.linkFailures <- linkFailureReport{
+		chanPoint: chanPoint,
+		chanID:    chanID,
+		linkErr: htlcswitch.LinkFailureError{
+			FailureAction: htlcswitch.LinkFailureForceNone,
+		},
+	}
+
+	select {
+	case out := <-reconnectedPeer.outgoingQueue:
+		_, ok := out.msg.(*lnwire.Error)
+		require.True(t, ok, "expected Error, got %T", out.msg)
+		out.errChan <- nil
+
+	case <-time.After(timeout):
+		t.Fatal("peer did not report the link failure")
+	}
+
+	_, channelFound := reconnectedPeer.activeChannels.Load(chanID)
+	require.False(t, channelFound)
+	_, closerFound := reconnectedPeer.activeChanCloses.Load(chanID)
+	require.False(t, closerFound)
+
+	// The mock switch doesn't mutate its link set in RemoveLink, so mirror
+	// the production result before delivering the next close message.
+	harness.mockSwitch.links = nil
+	reconnectedPeer.chanCloseMsgs <- &closeMsg{
+		cid: chanID,
+		msg: lnwire.NewShutdown(
+			chanID, genScript(t, p2wshAddress),
+		),
+	}
+
+	select {
+	case out := <-reconnectedPeer.outgoingQueue:
+		t.Fatalf("stale closer handled Shutdown: %T", out.msg)
+
+	case <-time.After(shortTimeout):
+	}
+
+	select {
+	case tx := <-harness.publishTx:
+		t.Fatalf("unexpected cooperative close broadcast: %v", tx)
+
+	case <-time.After(shortTimeout):
+	}
 }
 
 // TestPeerChannelClosureAcceptFeeInitiator tests the shutdown initiator's
