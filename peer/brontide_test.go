@@ -544,6 +544,116 @@ func TestLinkFailureRetiresRestoredLegacyCloser(t *testing.T) {
 	}
 }
 
+// TestLinkFailureNotifiesLocalCloseRequest checks that a locally initiated
+// legacy cooperative close is told why it will never finish when a
+// non-disconnecting link failure retires its channel. The closer is the only
+// writer of the request's error channel, so retiring it quietly would leave
+// the CloseChannel RPC waiting on a channel nobody can answer.
+func TestLinkFailureNotifiesLocalCloseRequest(t *testing.T) {
+	t.Parallel()
+
+	harness, err := createTestPeerWithChannel(t, noUpdate)
+	require.NoError(t, err)
+
+	var (
+		alicePeer  = harness.peer
+		bobChan    = harness.channel
+		mockSwitch = harness.mockSwitch
+	)
+	chanPoint := bobChan.ChannelPoint()
+	chanID := lnwire.NewChanIDFromOutPoint(chanPoint)
+	mockSwitch.links = append(
+		mockSwitch.links, newMockUpdateHandler(chanID),
+	)
+
+	// Alice starts the close, so her closer owns a live request whose error
+	// channel the RPC side is reading.
+	closeReq := &htlcswitch.ChanClose{
+		CloseType:      contractcourt.CloseRegular,
+		ChanPoint:      &chanPoint,
+		Updates:        make(chan interface{}, 1),
+		TargetFeePerKw: 12500,
+		Err:            make(chan error, 1),
+	}
+	alicePeer.localCloseChanReqs <- closeReq
+
+	// She is now the initiator and has sent her Shutdown.
+	select {
+	case out := <-alicePeer.outgoingQueue:
+		_, ok := out.msg.(*lnwire.Shutdown)
+		require.True(t, ok, "expected Shutdown, got %T", out.msg)
+
+	case <-time.After(timeout):
+		t.Fatal("peer did not send Shutdown")
+	}
+
+	// A link failure that leaves the peer connected still retires the
+	// channel and its closer.
+	alicePeer.linkFailures <- linkFailureReport{
+		chanPoint: chanPoint,
+		chanID:    chanID,
+		linkErr: htlcswitch.LinkFailureError{
+			FailureAction: htlcswitch.LinkFailureForceNone,
+		},
+	}
+
+	// Alice reports the failure to her peer, queued synchronously
+	// on the send queue. An error send needs someone on the other end
+	// of the queue, exactly as the existing link-failure test drains
+	// it.
+	select {
+	case out := <-alicePeer.outgoingQueue:
+		_, ok := out.msg.(*lnwire.Error)
+		require.True(t, ok, "expected Error, got %T", out.msg)
+		out.errChan <- nil
+
+	case <-time.After(timeout):
+		t.Fatal("peer did not report the link failure")
+	}
+
+	// The waiting caller has to learn the close is over, so the retirement
+	// answers the request it was waiting on.
+	select {
+	case err := <-closeReq.Err:
+		require.ErrorIs(t, err, ErrCoopCloseAbortedByLinkFailure)
+
+	case <-time.After(timeout):
+		t.Fatal("close request was not notified of the link failure")
+	}
+
+	// The retired channel is not driven further, and no closing transaction
+	// is published for it.
+	select {
+	case tx := <-harness.publishTx:
+		t.Fatalf("unexpected cooperative close broadcast: %v", tx)
+
+	case <-time.After(shortTimeout):
+	}
+
+	// A later close message for the retired channel is not answered.
+	mockSwitch.links = nil
+	alicePeer.chanCloseMsgs <- &closeMsg{
+		cid: chanID,
+		msg: lnwire.NewShutdown(
+			chanID, genScript(t, p2wshAddress),
+		),
+	}
+
+	select {
+	case out := <-alicePeer.outgoingQueue:
+		t.Fatalf("stale closer answered Shutdown: %T", out.msg)
+
+	case <-time.After(shortTimeout):
+	}
+
+	// The channel and closer are both gone from the peer's indexes.
+	_, channelFound := alicePeer.activeChannels.Load(chanID)
+	require.False(t, channelFound)
+
+	_, closerFound := alicePeer.activeChanCloses.Load(chanID)
+	require.False(t, closerFound)
+}
+
 // TestPeerChannelClosureAcceptFeeInitiator tests the shutdown initiator's
 // behavior if we can agree on the fee immediately.
 func TestPeerChannelClosureAcceptFeeInitiator(t *testing.T) {
