@@ -1014,7 +1014,8 @@ func TestPeerChannelClosureAcceptFeeInitiator(t *testing.T) {
 	}
 	closingSignedMsg, ok := msg.(*lnwire.ClosingSigned)
 	if !ok {
-		t.Fatalf("expected to receive closing signed message, got %T", msg)
+		t.Fatalf("expected to receive closing signed message, got %T",
+			msg)
 	}
 
 	// Bob should reply with the exact same fee in his next ClosingSigned
@@ -1034,8 +1035,8 @@ func TestPeerChannelClosureAcceptFeeInitiator(t *testing.T) {
 		msg: closingSigned,
 	}
 
-	// Alice should accept Bob's fee, broadcast the cooperative close tx, and
-	// send a ClosingSigned message back to Bob.
+	// Alice should accept Bob's fee, broadcast the cooperative close tx,
+	// and send a ClosingSigned message back to Bob.
 
 	// Alice should now broadcast the closing transaction.
 	select {
@@ -1062,7 +1063,8 @@ func TestPeerChannelClosureAcceptFeeInitiator(t *testing.T) {
 			bobFee, closingSignedMsg.FeeSatoshis)
 	}
 
-	// Alice should be waiting on a single confirmation for the coop close tx.
+	// Alice should be waiting on a single confirmation for the coop
+	// close tx.
 	notifier.ConfChan <- &chainntnfs.TxConfirmation{}
 }
 
@@ -1139,16 +1141,18 @@ func TestPeerChannelClosureFeeNegotiationsResponder(t *testing.T) {
 
 	parsedSig, err := lnwire.NewSigFromSignature(bobSig)
 	require.NoError(t, err, "error parsing signature")
-	closingSigned := lnwire.NewClosingSigned(chanID, increasedFee, parsedSig)
+	closingSigned := lnwire.NewClosingSigned(
+		chanID, increasedFee, parsedSig,
+	)
 	alicePeer.chanCloseMsgs <- &closeMsg{
 		cid: chanID,
 		msg: closingSigned,
 	}
 
-	// Alice will now see the new fee we propose, but with current settings it
-	// won't accept it immediately as it differs too much by its ideal fee. We
-	// should get a new proposal back, which should have the average fee rate
-	// proposed.
+	// Alice will now see the new fee we propose, but with current
+	// settings it won't accept it immediately as it differs too much by
+	// its ideal fee. We should get a new proposal back, which should have
+	// the average fee rate proposed.
 	select {
 	case outMsg := <-alicePeer.outgoingQueue:
 		msg = outMsg.msg
@@ -1161,8 +1165,8 @@ func TestPeerChannelClosureFeeNegotiationsResponder(t *testing.T) {
 		t.Fatalf("expected ClosingSigned message, got %T", msg)
 	}
 
-	// The fee sent by Alice should be less than the fee Bob just sent as Alice
-	// should attempt to compromise.
+	// The fee sent by Alice should be less than the fee Bob just sent as
+	// Alice should attempt to compromise.
 	aliceFee := aliceClosingSigned.FeeSatoshis
 	if aliceFee > increasedFee {
 		t.Fatalf("new fee should be less than our fee: new=%v, "+
@@ -1185,9 +1189,9 @@ func TestPeerChannelClosureFeeNegotiationsResponder(t *testing.T) {
 		msg: closingSigned,
 	}
 
-	// Bob's latest proposal still won't be accepted and Alice should send over
-	// a new ClosingSigned message. It should be the average of what Bob and
-	// Alice each proposed last time.
+	// Bob's latest proposal still won't be accepted and Alice should send
+	// over a new ClosingSigned message. It should be the average of what
+	// Bob and Alice each proposed last time.
 	select {
 	case outMsg := <-alicePeer.outgoingQueue:
 		msg = outMsg.msg
@@ -1212,8 +1216,8 @@ func TestPeerChannelClosureFeeNegotiationsResponder(t *testing.T) {
 			"prior=%v", aliceFee, increasedFee)
 	}
 
-	// Finally, Bob will accept the fee by echoing back the same fee that Alice
-	// just sent over.
+	// Finally, Bob will accept the fee by echoing back the same fee that
+	// Alice just sent over.
 	bobSig, _, _, err = bobChan.CreateCloseProposal(
 		aliceFee, dummyDeliveryScript, aliceDeliveryScript,
 	)
@@ -1335,7 +1339,9 @@ func TestPeerChannelClosureFeeNegotiationsInitiator(t *testing.T) {
 	parsedSig, err := lnwire.NewSigFromSignature(bobSig)
 	require.NoError(t, err, "unable to parse signature")
 
-	closingSigned := lnwire.NewClosingSigned(chanID, increasedFee, parsedSig)
+	closingSigned := lnwire.NewClosingSigned(
+		chanID, increasedFee, parsedSig,
+	)
 	alicePeer.chanCloseMsgs <- &closeMsg{
 		cid: chanID,
 		msg: closingSigned,
@@ -1404,8 +1410,8 @@ func TestPeerChannelClosureFeeNegotiationsInitiator(t *testing.T) {
 			aliceFee, lastReceivedFee)
 	}
 	if aliceFee > lastSentFee {
-		t.Fatalf("new fee should be less than Bob's fee: new=%v, old=%v",
-			aliceFee, lastSentFee)
+		t.Fatalf("new fee should be less than Bob's fee: new=%v, "+
+			"old=%v", aliceFee, lastSentFee)
 	}
 
 	// Bob will now accept their fee by sending back a ClosingSigned message
@@ -1438,10 +1444,12 @@ func TestPeerChannelClosureFeeNegotiationsInitiator(t *testing.T) {
 		t.Fatalf("did not receive closing signed message")
 	}
 	if _, ok := msg.(*lnwire.ClosingSigned); !ok {
-		t.Fatalf("expected to receive closing signed message, got %T", msg)
+		t.Fatalf("expected to receive closing signed message, got %T",
+			msg)
 	}
 
-	// Alice should be waiting on a single confirmation for the coop close tx.
+	// Alice should be waiting on a single confirmation for the coop
+	// close tx.
 	notifier.ConfChan <- &chainntnfs.TxConfirmation{}
 }
 
@@ -1453,6 +1461,10 @@ func TestChooseDeliveryScript(t *testing.T) {
 	// generate non-zero scripts for testing.
 	script1 := genScript(t, p2SHAddress)
 	script2 := genScript(t, p2wshAddress)
+
+	// errMismatch is returned when the upfront and user shutdown
+	// scripts disagree.
+	errMismatch := chancloser.ErrUpfrontShutdownScriptMismatch
 
 	tests := []struct {
 		name           string
@@ -1474,7 +1486,7 @@ func TestChooseDeliveryScript(t *testing.T) {
 			userScript:     script1,
 			shutdownScript: script2,
 			expectedScript: nil,
-			expectedError:  chancloser.ErrUpfrontShutdownScriptMismatch,
+			expectedError:  errMismatch,
 		},
 		{
 			name:           "Only upfront script",
@@ -1503,13 +1515,12 @@ func TestChooseDeliveryScript(t *testing.T) {
 	}
 
 	for _, test := range tests {
-
 		t.Run(test.name, func(t *testing.T) {
 			script, err := chooseDeliveryScript(
 				test.shutdownScript, test.userScript,
 				test.newAddr,
 			)
-			if err != test.expectedError {
+			if !errors.Is(err, test.expectedError) {
 				t.Fatalf("Expected: %v, got: %v",
 					test.expectedError, err)
 			}
@@ -1528,8 +1539,11 @@ func TestChooseDeliveryScript(t *testing.T) {
 func TestCustomShutdownScript(t *testing.T) {
 	script := genScript(t, p2SHAddress)
 
+	// errMismatch is returned when the upfront and user shutdown
+	// scripts disagree.
+	errMismatch := chancloser.ErrUpfrontShutdownScriptMismatch
+
 	// setShutdown is a function which sets the upfront shutdown address for
-	// the local channel.
 	setShutdown := func(a, b *chanstate.OpenChannel) {
 		a.LocalShutdownScript = script
 		b.RemoteShutdownScript = script
@@ -1538,15 +1552,16 @@ func TestCustomShutdownScript(t *testing.T) {
 	tests := []struct {
 		name string
 
-		// update is a function used to set values on the channel set up for the
-		// test. It is used to set values for upfront shutdown addresses.
+		// update is a function used to set values on the channel set up
+		// for the test. It is used to set values for upfront shutdown
+		// addresses.
 		update func(a, b *chanstate.OpenChannel)
 
 		// userCloseScript is the address specified by the user.
 		userCloseScript lnwire.DeliveryAddress
 
-		// expectedScript is the address we expect to be set on the shutdown
-		// message.
+		// expectedScript is the address we expect to be set on the
+		// shutdown message.
 		expectedScript lnwire.DeliveryAddress
 
 		// expectedError is the error we expect, if any.
@@ -1577,12 +1592,11 @@ func TestCustomShutdownScript(t *testing.T) {
 			name:            "Shutdown set, user script different",
 			update:          setShutdown,
 			userCloseScript: []byte("different addr"),
-			expectedError:   chancloser.ErrUpfrontShutdownScriptMismatch,
+			expectedError:   errMismatch,
 		},
 	}
 
 	for _, test := range tests {
-
 		t.Run(test.name, func(t *testing.T) {
 			// Open a channel.
 			harness, err := createTestPeerWithChannel(
@@ -1754,7 +1768,6 @@ func TestStaticRemoteDowngrade(t *testing.T) {
 	}
 
 	for _, test := range tests {
-
 		t.Run(test.name, func(t *testing.T) {
 			params := createTestPeer(t)
 
@@ -3211,7 +3224,6 @@ func TestHandleRemovePendingChannel(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-
 		// Create a request for testing.
 		errChan := make(chan error, 1)
 		req := &newChannelMsg{
@@ -3313,7 +3325,7 @@ func TestStartupWriteMessageRace(t *testing.T) {
 
 	// Ensure messages were sent during startup.
 	<-sendPingDone
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		select {
 		case <-mockConn.writtenMessages:
 		default:
@@ -3778,6 +3790,183 @@ func TestRbfCoopCloseAllowed(t *testing.T) {
 	}
 }
 
+// TestObserveRbfCloseOrdering checks that an RBF close reports an outcome to
+// its caller according to which path claimed the caller first. The observer
+// that watches the closer's states must take the caller's record before it
+// reports, so a closer that was already retired cannot tell a caller the
+// close succeeded after it was told it had ended.
+func TestObserveRbfCloseOrdering(t *testing.T) {
+	t.Parallel()
+
+	// noClaim drives a closer to its terminal state with the caller's
+	// record still unclaimed, which is the ordinary path.
+	t.Run("an unclaimed caller is told the close succeeded", func(
+		t *testing.T) {
+
+		t.Parallel()
+
+		harness, err := createTestPeerWithChannel(t, noUpdate)
+		require.NoError(t, err)
+
+		var (
+			alicePeer = harness.peer
+			bobChan   = harness.channel
+		)
+
+		chanPoint := bobChan.ChannelPoint()
+		chanID := lnwire.NewChanIDFromOutPoint(chanPoint)
+
+		router := msgmux.NewMultiMsgRouter()
+		router.Start(t.Context())
+		t.Cleanup(router.Stop)
+		alicePeer.msgRouter = fn.Some[msgmux.Router](router)
+		alicePeer.globalMsgRouter = true
+
+		rbfCloser := initTestRbfCloser(t, alicePeer, bobChan)
+		alicePeer.activeChanCloses.Store(
+			chanID, makeRbfCloser(rbfCloser),
+		)
+
+		closeReq := &htlcswitch.ChanClose{
+			ChanPoint: &chanPoint,
+			Updates:   make(chan interface{}, 5),
+			Err:       actor.NewPromise[error](),
+		}
+		alicePeer.activeCloseReqs.add(chanID, closeReq)
+
+		// Subscribe before anything can drive the closer, so that the
+		// terminal state cannot be reached before the observer is
+		// listening for it.
+		stateSub := rbfCloser.RegisterStateEvents()
+
+		alicePeer.cg.WgAdd(1)
+		go func() {
+			defer alicePeer.cg.WgDone()
+
+			alicePeer.observeRbfCloseUpdates(
+				rbfCloser, closeReq, stateSub,
+			)
+		}()
+
+		// A spend of the funding outpoint is the terminal transition,
+		// so the observer reaches its CloseFin branch.
+		rbfCloser.SendEvent(t.Context(), &chancloser.SpendEvent{
+			Tx: wire.NewMsgTx(1),
+		})
+
+		select {
+		case update := <-closeReq.Updates:
+			closeUpdate, ok := update.(*ChannelCloseUpdate)
+			require.True(t, ok, "expected a close update, got %T",
+				update)
+			require.True(t, closeUpdate.Success)
+
+		case <-time.After(timeout):
+			t.Fatal("caller was not told the close succeeded")
+		}
+
+		// The record is claimed by the observer, so nothing is left for
+		// a retirement to report to.
+		require.Nil(t, alicePeer.activeCloseReqs.peek(chanID))
+	})
+
+	// A caller that was already claimed has been told how the close ended,
+	// so the terminal state must not deliver a second, contradictory
+	// outcome to it.
+	t.Run("a claimed caller is not told twice", func(t *testing.T) {
+		t.Parallel()
+
+		harness, err := createTestPeerWithChannel(t, noUpdate)
+		require.NoError(t, err)
+
+		var (
+			alicePeer = harness.peer
+			bobChan   = harness.channel
+		)
+
+		chanPoint := bobChan.ChannelPoint()
+		chanID := lnwire.NewChanIDFromOutPoint(chanPoint)
+
+		router := msgmux.NewMultiMsgRouter()
+		router.Start(t.Context())
+		t.Cleanup(router.Stop)
+		alicePeer.msgRouter = fn.Some[msgmux.Router](router)
+		alicePeer.globalMsgRouter = true
+
+		rbfCloser := initTestRbfCloser(t, alicePeer, bobChan)
+		alicePeer.activeChanCloses.Store(
+			chanID, makeRbfCloser(rbfCloser),
+		)
+
+		closeReq := &htlcswitch.ChanClose{
+			ChanPoint: &chanPoint,
+			Updates:   make(chan interface{}, 5),
+			Err:       actor.NewPromise[error](),
+		}
+		alicePeer.activeCloseReqs.add(chanID, closeReq)
+
+		// Subscribe before anything can drive the closer, so that the
+		// terminal state cannot be reached before the observer is
+		// listening for it.
+		stateSub := rbfCloser.RegisterStateEvents()
+
+		alicePeer.cg.WgAdd(1)
+		go func() {
+			defer alicePeer.cg.WgDone()
+
+			alicePeer.observeRbfCloseUpdates(
+				rbfCloser, closeReq, stateSub,
+			)
+		}()
+
+		// Answer the caller the way a retirement does before the
+		// closer reaches its terminal state, so the terminal state
+		// must not deliver a second, contradictory outcome.
+		alicePeer.abortRemainingCloseReqs(
+			chanID, ErrCoopCloseAbortedByLinkFailure,
+		)
+
+		rbfCloser.SendEvent(t.Context(), &chancloser.SpendEvent{
+			Tx: wire.NewMsgTx(1),
+		})
+
+		// The terminal branch retires the closer, and it does so after
+		// it would have sent an update, so waiting for the retirement
+		// makes the assertion below meaningful rather than merely
+		// early.
+		err = wait.NoError(func() error {
+			_, found := alicePeer.activeChanCloses.Load(chanID)
+			if found {
+				return fmt.Errorf("closer was not retired")
+			}
+
+			return nil
+		}, timeout)
+		require.NoError(t, err)
+
+		// The observer must not deliver a success update, since the
+		// caller already has an outcome and a second one would
+		// contradict it.
+		select {
+		case update := <-closeReq.Updates:
+			t.Fatalf("caller was told twice: %v", update)
+
+		case <-time.After(shortTimeout):
+		}
+
+		// The outcome the caller already has must stand.
+		select {
+		case err := <-closeReq.ErrChan(t.Context()):
+			require.ErrorIs(
+				t, err, ErrCoopCloseAbortedByLinkFailure,
+			)
+
+		case <-time.After(timeout):
+			t.Fatal("caller was not told the close ended")
+		}
+	})
+}
+
 // TestCloseReqRegistryOverlappingCallers checks that two callers waiting on a
 // close for one channel are both answered. A fee bump for a close already in
 // progress registers a second caller, and holding only one record per channel
@@ -4030,8 +4219,8 @@ func TestRbfCloseSuccessSurvivesShutdown(t *testing.T) {
 	// shutdown has already returned.
 	select {
 	case <-reported:
-		t.Fatal("a confirmed close was given up on when the peer shut " +
-			"down")
+		t.Fatal("a confirmed close was given up on when the peer " +
+			"shut down")
 
 	case <-time.After(shortTimeout):
 	}
