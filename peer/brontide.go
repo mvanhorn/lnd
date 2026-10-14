@@ -114,10 +114,11 @@ var (
 	ErrChannelNotFound = fmt.Errorf("channel not found")
 
 	// ErrCoopCloseAbortedByLinkFailure is delivered to a locally initiated
-	// cooperative close whose closer was retired because the channel's
-	// link failed. The closer is the only writer of the request's error
-	// channel, so retiring it without this notification would leave the
-	// caller waiting for an update that can never arrive.
+	// cooperative close that is retired without reaching a close, most
+	// often because the channel's link failed. A retirement that does not
+	// name a more specific reason reports this one. Were the caller not
+	// told, it would wait on a close that nothing is left to finish, since
+	// a retired closer answers nothing further.
 	ErrCoopCloseAbortedByLinkFailure = errors.New(
 		"cooperative close aborted by link failure",
 	)
@@ -699,9 +700,7 @@ type Brontide struct {
 	// activeCloseReqs tracks the callers waiting on a cooperative close
 	// that the active closers do not carry themselves. The legacy closer
 	// holds its own request, but the RBF one does not, so a caller is only
-	// reachable here. An entry is present only while a caller may still be
-	// waiting, and it is claimed exactly once, by whichever path ends the
-	// close first.
+	// reachable here.
 	activeCloseReqs *closeReqRegistry
 
 	// linkFailures receives all reported channel failures from the switch,
@@ -1927,8 +1926,8 @@ func (p *Brontide) deleteActiveChanCloser(chanID lnwire.ChannelID,
 
 	// Tell any caller still waiting that the close is over. A caller that
 	// knows a different reason answers it before retiring the closer, so
-	// nothing is left to report here, and every caller still waiting is
-	// owed the same outcome.
+	// the claim below then finds nothing left to report and this is the
+	// fallback for the paths that retire a closer on their own.
 	p.abortRemainingCloseReqs(chanID, ErrCoopCloseAbortedByLinkFailure)
 
 	p.unregisterRbfCloseActor(chanPoint)
@@ -1939,8 +1938,9 @@ func (p *Brontide) deleteActiveChanCloser(chanID lnwire.ChannelID,
 // created it: an RBF closer left running stays registered with the router
 // and keeps a goroutine, and a caller left waiting is never answered.
 //
-// NOTE: MUST be called before the peer's context is cancelled, because
-// answering a caller is a send that gives up once that context is done.
+// NOTE: MUST be called before the peer's context is cancelled, so that a
+// closer's own cancellation cannot be observed as the reason the close ended
+// before this walk has named the real one.
 func (p *Brontide) abandonChanClosers(abortErr error) {
 	// Collect first, then retire: retiring mutates the map being walked.
 	var closers []lnwire.ChannelID
@@ -1987,33 +1987,81 @@ func (p *Brontide) chanPointForCloser(chanID lnwire.ChannelID) (wire.OutPoint,
 	return wire.OutPoint{}, false
 }
 
-// claimCloseReq takes ownership of the record of a caller waiting on a
-// cooperative close, reporting whether this caller got it. Only one caller
-// may own a record, which is what keeps a single close from being reported
-// twice: a request carries room for one outcome.
-// takeIfOwner takes the caller's own record, so that a path acting for one
-// caller cannot take a record belonging to a different caller on the same
-// channel.
-func (p *Brontide) takeIfOwner(chanID lnwire.ChannelID,
-	req *htlcswitch.ChanClose) *htlcswitch.ChanClose {
-	return p.activeCloseReqs.takeIf(chanID, req)
+// reportRbfCloseErr reports a failed close to the caller the observer was
+// started for. The caller's record is taken first, so that the sweep another
+// path runs when the close finally resolves cannot deliver this caller a
+// second, contradictory outcome: resolving a request refuses a further
+// resolution, but the updates it carries are a separate channel that nothing
+// would refuse. Only the path that took the record reports.
+func (p *Brontide) reportRbfCloseErr(closeReq *htlcswitch.ChanClose,
+	err error) {
+
+	if closeReq == nil {
+		return
+	}
+
+	chanID := lnwire.NewChanIDFromOutPoint(*closeReq.ChanPoint)
+	if p.activeCloseReqs.takeIf(chanID, closeReq) == nil {
+		return
+	}
+
+	closeReq.CompleteErr(err)
+}
+
+// reportRbfCloseSuccess reports a close that reached its close and confirmed
+// to every caller still waiting on the channel. The callers are taken before
+// anything is delivered, so a retirement racing this cannot answer one of them
+// with the opposite, and each one that is still reading is told the close
+// succeeded.
+//
+// The peer's shutdown deliberately does not abandon this: the closing
+// transaction has been broadcast and confirms on chain whether or not the peer
+// is still with us, so the outcome is a property of the chain, and the records
+// are already taken, so no other path could answer them.
+func (p *Brontide) reportRbfCloseSuccess(chanID lnwire.ChannelID,
+	closingTxid chainhash.Hash) {
+
+	for _, req := range p.activeCloseReqs.takeAll(chanID) {
+		delivered := false
+		select {
+		case req.Updates <- &ChannelCloseUpdate{
+			ClosingTxid: closingTxid[:],
+			Success:     true,
+		}:
+			delivered = true
+
+		case <-req.Done():
+		}
+
+		// The request is ended once the caller has been told how the
+		// close ended, so that a caller which derived a channel from it
+		// is not left waiting on a close that has finished.
+		if delivered {
+			req.CompleteErr(nil)
+		}
+	}
 }
 
 // abortRemainingCloseReqs tells every caller still waiting on a close for the
 // channel that it will not complete, since the closer that would have finished
-// it is gone.
+// it is gone. Each caller is resolved, and resolution takes effect once, so a
+// caller another path already answered keeps that outcome.
 func (p *Brontide) abortRemainingCloseReqs(chanID lnwire.ChannelID,
 	abortErr error) {
 
 	for _, closeReq := range p.activeCloseReqs.takeAll(chanID) {
-		p.abortCloseRequest(closeReq, abortErr)
+		closeReq.CompleteErr(abortErr)
 	}
 }
 
 // releaseCloseReq gives up the caller's own record, for a caller that has gone
-// away and will not read an outcome.
+// away and will not read an outcome. Giving up the record of a caller that
+// another path already resolved does nothing.
 func (p *Brontide) releaseCloseReq(chanID lnwire.ChannelID,
 	req *htlcswitch.ChanClose) {
+	// Giving up a record is taking it and discarding it. A caller that
+	// another path already resolved has no record left, and giving up
+	// nothing is nothing.
 	_ = p.activeCloseReqs.takeIf(chanID, req)
 }
 
@@ -2030,10 +2078,13 @@ func (p *Brontide) releaseCloseReq(chanID lnwire.ChannelID,
 // `abortErr` is the reason the caller is told, since what ends a close is
 // not always a link failure.
 //
-// `resetState` says whether this runs on the goroutine that owns the channel
-// and may therefore clear its closing flag. A caller that does not own the
-// channel leaves that to the channel manager, which resets the state of the
-// channels it still owns as it drains.
+// This is safe to call from any goroutine. Reading a closer's request is
+// safe because a closer's request is set once, when it is created, and never
+// replaced, and the state it carries is reset only on the goroutine that
+// owns the channel: when this runs on the channel manager's goroutine (the
+// link-failure path) it resets the channel inline, and when it runs anywhere
+// else (the disconnect path) it leaves that to the channel manager, which
+// resets the state of every channel it still owns as it drains.
 func (p *Brontide) notifyChanCloserOfAbort(chanID lnwire.ChannelID,
 	abortErr error, resetState bool) {
 
@@ -2049,67 +2100,23 @@ func (p *Brontide) notifyChanCloserOfAbort(chanID lnwire.ChannelID,
 
 			// Clear the channel's closing flag, which the shutdown
 			// marked, when this runs on the goroutine that owns the
-			// channel. It gates the legacy close on the channel, so
-			// leaving it set would make any later attempt to close
-			// this channel fail as already closing. The other
-			// teardown paths reset it for the same reason.
+			// channel. Every other teardown path resets it for the
+			// same reason, so leaving it set would make a later
+			// attempt to close this channel fail as already
+			// closing. A caller that does not own the channel
+			// leaves this to the channel manager, which resets the
+			// state of the channels it still owns as it drains.
 			if resetState {
 				chanCloser.Channel().ResetState()
 			}
 
-			p.abortCloseRequest(closeReq, abortErr)
+			closeReq.CompleteErr(abortErr)
 		})
 	}
 
 	// The RBF closer is not reachable through the map entry above, so
 	// take its caller from the tracking map instead.
-	p.abortRbfCloseRequest(chanID, abortErr)
-}
-
-// abortRbfCloseRequest tells the caller waiting on an RBF cooperative close
-// that the close will not complete. The tracking map is claimed with
-// LoadAndDelete so that exactly one of the paths racing to end this close
-// reports to the caller, since the request carries room for one outcome.
-//
-// NOTE: MUST be called from the channelManager goroutine.
-func (p *Brontide) abortRbfCloseRequest(chanID lnwire.ChannelID,
-	abortErr error) {
 	p.abortRemainingCloseReqs(chanID, abortErr)
-}
-
-// abortCloseRequest tells a caller waiting on a cooperative close that the
-// close will not complete, so it stops waiting on a closer that is gone.
-//
-// NOTE: MUST be called from the channelManager goroutine.
-func (p *Brontide) abortCloseRequest(closeReq *htlcswitch.ChanClose,
-	abortErr error) {
-
-	// The request owns the slot it reads from, so a send takes it without
-	// waiting on the caller. Deliver it here when that slot is free, which
-	// is the normal case: a caller is answered once, and the channel is
-	// sized for one outcome.
-	//
-	// This also matters during teardown, where the peer's context is
-	// cancelled immediately after this call. Deferring the send to another
-	// goroutine would leave that send racing the cancellation, and Go
-	// picks freely between two ready cases, so the caller could be left
-	// without its outcome.
-	select {
-	case closeReq.Err <- abortErr:
-		return
-
-	default:
-	}
-
-	// The slot is not free, so the caller either already has its outcome
-	// or is not reading. Hand the send to its own goroutine, because this
-	// can be reached from a closer's own goroutine and must not wait here.
-	go func() {
-		select {
-		case closeReq.Err <- abortErr:
-		case <-p.cg.Done():
-		}
-	}()
 }
 
 // unregisterRbfCloseActors removes any RBF close actors registered for this
@@ -4256,26 +4263,7 @@ func (p *Brontide) observeRbfCloseUpdates(chanCloser *chancloser.RbfChanCloser,
 			peerLog.Warnf("ChannelPoint(%v): encountered close "+
 				"err: %v", closeReq.ChanPoint, err)
 
-			// Claim the caller before reporting to it, so a
-			// retirement racing this report cannot tell it a
-			// second outcome.
-			chanID := lnwire.NewChanIDFromOutPoint(
-				*closeReq.ChanPoint,
-			)
-
-			// Report only if this observer still owns the
-			// caller's record: a retirement that ran first has
-			// already told it how the close ended, and a second
-			// report would have nowhere to go.
-			if p.takeIfOwner(chanID, closeReq) == nil {
-				return
-			}
-
-			select {
-			case closeReq.Err <- err:
-			case <-closeReq.Ctx.Done():
-			case <-p.cg.Done():
-			}
+			p.reportRbfCloseErr(closeReq, err)
 
 			return
 		}
@@ -4319,7 +4307,7 @@ func (p *Brontide) observeRbfCloseUpdates(chanCloser *chancloser.RbfChanCloser,
 				),
 			}:
 
-			case <-closeReq.Ctx.Done():
+			case <-closeReq.Done():
 				return
 
 			case <-p.cg.Done():
@@ -4369,22 +4357,7 @@ func (p *Brontide) observeRbfCloseUpdates(chanCloser *chancloser.RbfChanCloser,
 					*closeReq.ChanPoint,
 				)
 
-				// The close succeeded, so every caller still
-				// waiting on this channel is owed that outcome.
-				// Taking them before delivering means a
-				// retirement racing this cannot answer them
-				// with the opposite.
-				for _, req := range p.activeCloseReqs.takeAll(
-					chanID,
-				) {
-
-					if req != nil {
-						req.Updates <- &ChannelCloseUpdate{
-							ClosingTxid: closingTxid[:],
-							Success:     true,
-						}
-					}
-				}
+				p.reportRbfCloseSuccess(chanID, closingTxid)
 
 				p.deleteActiveChanCloser(
 					chanID, *closeReq.ChanPoint,
@@ -4397,7 +4370,7 @@ func (p *Brontide) observeRbfCloseUpdates(chanCloser *chancloser.RbfChanCloser,
 		// shutting down. Nothing will read an outcome, so give up the
 		// record rather than leaving it for a retirement to find and
 		// answer forever.
-		case <-closeReq.Ctx.Done():
+		case <-closeReq.Done():
 			chanID := lnwire.NewChanIDFromOutPoint(
 				*closeReq.ChanPoint,
 			)
@@ -4980,7 +4953,7 @@ func (p *Brontide) handleLocalCloseReq(req *htlcswitch.ChanClose) {
 		err := fmt.Errorf("unable to close channel, ChannelID(%v) is "+
 			"unknown", chanID)
 		p.log.Errorf(err.Error())
-		req.Err <- err
+		req.CompleteErr(err)
 
 		return
 	}
@@ -5007,7 +4980,7 @@ func (p *Brontide) handleLocalCloseReq(req *htlcswitch.ChanClose) {
 
 		if err != nil {
 			p.log.Errorf(err.Error())
-			req.Err <- err
+			req.CompleteErr(err)
 		}
 
 	// A type of CloseBreach indicates that the counterparty has breached
@@ -5017,6 +4990,12 @@ func (p *Brontide) handleLocalCloseReq(req *htlcswitch.ChanClose) {
 		p.log.Infof("ChannelPoint(%v) has been breached, wiping "+
 			"channel", req.ChanPoint)
 		p.WipeChannel(req.ChanPoint)
+
+		// The channel is gone, so the close is over as far as this
+		// caller is concerned. No closer owns the request, so leaving
+		// it unresolved would leave the caller waiting on a close that
+		// nothing is left to finish.
+		req.CompleteErr(ErrCoopCloseAbortedByLinkFailure)
 	}
 }
 
@@ -5170,19 +5149,22 @@ func (p *Brontide) finalizeChanClosure(chanCloser *chancloser.ChanCloser) {
 	// confirmation.
 	notifier := p.cfg.ChainNotifier
 
-	// If any error happens during waitForChanToClose, forward it to
-	// closeReq. If this channel closure is not locally initiated, closeReq
-	// will be nil, so just ignore the error.
-	errChan := make(chan error, 1)
+	// If any error happens while waiting for the close to confirm, it is
+	// reported to closeReq. The notification is reported through a callback
+	// rather than a channel, so there is no relay goroutine that a peer
+	// shutdown could stop before it forwards anything: once the closing
+	// transaction is broadcast, this outcome is a property of the chain,
+	// not of the peer.
+	onCloseErr := func(err error) {}
 	if closeReq != nil {
-		errChan = closeReq.Err
+		onCloseErr = closeReq.CompleteErr
 	}
 
 	closingTx, err := chanCloser.ClosingTx()
 	if err != nil {
 		if closeReq != nil {
 			p.log.Error(err)
-			closeReq.Err <- err
+			closeReq.CompleteErr(err)
 		}
 	}
 
@@ -5191,8 +5173,14 @@ func (p *Brontide) finalizeChanClosure(chanCloser *chancloser.ChanCloser) {
 	// If this is a locally requested shutdown, update the caller with a
 	// new event detailing the current pending state of this request.
 	if closeReq != nil {
-		closeReq.Updates <- &PendingUpdate{
+		select {
+		case closeReq.Updates <- &PendingUpdate{
 			Txid: closingTxid[:],
+		}:
+
+		case <-closeReq.Done():
+
+		case <-p.cg.Done():
 		}
 	}
 
@@ -5213,17 +5201,38 @@ func (p *Brontide) finalizeChanClosure(chanCloser *chancloser.ChanCloser) {
 	// Register for full confirmation to send the final update.
 	closeScript := closingTx.TxOut[0].PkScript
 	go WaitForChanToClose(
-		chanCloser.NegotiationHeight(), notifier, errChan,
+		chanCloser.NegotiationHeight(), notifier, onCloseErr,
 		&chanPoint, &closingTxid, closeScript, numConfs, func() {
 			// Respond to the local subsystem which requested the
 			// channel closure.
 			if closeReq != nil {
-				closeReq.Updates <- &ChannelCloseUpdate{
-					ClosingTxid:       closingTxid[:],
-					Success:           true,
+				delivered := false
+				select {
+				case closeReq.Updates <- &ChannelCloseUpdate{
+					ClosingTxid: closingTxid[:],
+					Success:     true,
+
 					LocalCloseOutput:  localOut,
 					RemoteCloseOutput: remoteOut,
 					AuxOutputs:        auxOut,
+				}:
+					delivered = true
+
+				case <-closeReq.Done():
+				}
+
+				// End the request once the caller has been told
+				// how the close ended, so that a caller which
+				// derived a channel from it is not left
+				// waiting on a close that has finished. The
+				// peer's own shutdown deliberately does not
+				// abandon this: the closing transaction is
+				// broadcast and confirms on chain whether or
+				// not the peer is still with us, so dropping
+				// the outcome here would discard a close that
+				// actually succeeded.
+				if delivered {
+					closeReq.CompleteErr(nil)
 				}
 			}
 		},
@@ -5234,9 +5243,9 @@ func (p *Brontide) finalizeChanClosure(chanCloser *chancloser.ChanCloser) {
 // been detected as closed on chain and then concludes by executing the
 // following actions: the channel point will be sent over the settleChan, and
 // finally the callback will be executed. If any error is encountered within
-// the function, then it will be sent over the errChan.
+// the function, then onErr is called with it.
 func WaitForChanToClose(bestHeight uint32, notifier chainntnfs.ChainNotifier,
-	errChan chan error, chanPoint *wire.OutPoint,
+	onErr func(error), chanPoint *wire.OutPoint,
 	closingTxID *chainhash.Hash, closeScript []byte, numConfs uint32,
 	cb func()) {
 
@@ -5247,9 +5256,10 @@ func WaitForChanToClose(bestHeight uint32, notifier chainntnfs.ChainNotifier,
 		closingTxID, closeScript, numConfs, bestHeight,
 	)
 	if err != nil {
-		if errChan != nil {
-			errChan <- err
+		if onErr != nil {
+			onErr(err)
 		}
+
 		return
 	}
 
@@ -5907,8 +5917,8 @@ func (p *Brontide) negotiateCloseErrHandler(cid lnwire.ChannelID,
 		// As the negotiations failed, we'll reset the channel state
 		// machine to ensure we act to on-chain events as normal.
 		chanCloser.Channel().ResetState()
-		if chanCloser.CloseRequest() != nil {
-			chanCloser.CloseRequest().Err <- err
+		if closeReq := chanCloser.CloseRequest(); closeReq != nil {
+			closeReq.CompleteErr(err)
 		}
 
 		p.deleteActiveChanCloser(
@@ -6414,7 +6424,16 @@ func (p *Brontide) createHtlcValidator(dbChan *chanstate.OpenChannel,
 type CoopCloseUpdates struct {
 	UpdateChan chan interface{}
 
-	ErrChan chan error
+	// ErrPromise is resolved by whichever path ends the close, at most
+	// once, and never blocks the path that resolves it.
+	ErrPromise actor.Promise[error]
+}
+
+// ErrChan returns the channel that carries the error this close ended with,
+// and stays silent when it ends without one. It is derived from the promise so
+// that a caller waiting on channels sees no change.
+func (c *CoopCloseUpdates) ErrChan(ctx context.Context) chan error {
+	return (&htlcswitch.ChanClose{Err: c.ErrPromise}).ErrChan(ctx)
 }
 
 // ChanHasRbfCoopCloser returns true if the channel as identifier by the channel

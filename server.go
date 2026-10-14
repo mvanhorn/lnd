@@ -1353,8 +1353,15 @@ func newServer(ctx context.Context, cfg *Config, listenAddrs []net.Addr,
 		// Instruct the switch to close the channel.  Provide no close out
 		// delivery script or target fee per kw because user input is not
 		// available when the remote peer closes the channel.
+		// The request this starts is resolved by whichever path
+		// finishes the close, and bound it to the daemon's own
+		// lifetime so that a request nothing resolves cannot leave a
+		// caller waiting past shutdown.
+		ctx, cancel := lnutils.ContextFromQuit(s.quit)
+		defer cancel()
+
 		s.htlcSwitch.CloseLink(
-			context.Background(), chanPoint, closureType, 0, 0, nil,
+			ctx, chanPoint, closureType, 0, 0, nil,
 		)
 	}
 
