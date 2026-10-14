@@ -654,6 +654,197 @@ func TestLinkFailureNotifiesLocalCloseRequest(t *testing.T) {
 	require.False(t, closerFound)
 }
 
+// TestRetireChanCloserReleasesRbfResources checks that retiring an RBF
+// closer releases everything that closer owns, not just its entry in the
+// active closers map. A closer left registered with the router can still be
+// handed messages for a channel it no longer belongs to, and one left
+// running keeps a goroutine alive for the life of the process.
+func TestRetireChanCloserReleasesRbfResources(t *testing.T) {
+	t.Parallel()
+
+	harness, err := createTestPeerWithChannel(t, noUpdate)
+	require.NoError(t, err)
+
+	var (
+		alicePeer = harness.peer
+		bobChan   = harness.channel
+	)
+
+	chanPoint := bobChan.ChannelPoint()
+	chanID := lnwire.NewChanIDFromOutPoint(chanPoint)
+
+	// Drive a real router, so the test observes the endpoints the peer
+	// actually registers and unregisters for this closer rather than a
+	// recorded stand-in.
+	router := msgmux.NewMultiMsgRouter()
+	router.Start(t.Context())
+	t.Cleanup(router.Stop)
+	alicePeer.msgRouter = fn.Some[msgmux.Router](router)
+	alicePeer.globalMsgRouter = true
+
+	// Build a real RBF closer for this channel and put it in the map the
+	// way initRbfChanCloser does.
+	rbfCloser := initTestRbfCloser(t, alicePeer, bobChan)
+	require.True(t, rbfCloser.IsRunning())
+	alicePeer.activeChanCloses.Store(chanID, makeRbfCloser(rbfCloser))
+
+	alicePeer.deleteActiveChanCloser(chanID, chanPoint)
+
+	// The entry is gone, so nothing can look the closer up any more.
+	_, found := alicePeer.activeChanCloses.Load(chanID)
+	require.False(t, found)
+
+	// The closer's endpoint is unregistered, so a close message for this
+	// channel no longer reaches a closer the channel has left behind.
+	// Retiring without this leaves the retired closer routable. The
+	// release runs on its own goroutine, since it must not block a closer
+	// that is being retired from inside its own state machine, so poll for
+	// the result instead of assuming it already happened.
+	closeMsg := msgmux.PeerMsg{
+		PeerPub: *alicePeer.IdentityKey(),
+		Message: lnwire.NewShutdown(chanID, genScript(t, p2wshAddress)),
+	}
+	err = wait.Predicate(func() bool {
+		return errors.Is(
+			routeMsg(t, alicePeer, closeMsg),
+			msgmux.ErrUnableToRouteMsg,
+		)
+	}, timeout)
+	require.NoError(t, err)
+
+	// The state machine was stopped, so it no longer drives itself.
+	err = wait.NoError(func() error {
+		if rbfCloser.IsRunning() {
+			return fmt.Errorf("rbf closer still running")
+		}
+
+		return nil
+	}, timeout)
+	require.NoError(t, err)
+}
+
+// initTestRbfCloser builds a real RBF closer for the given channel by
+// negotiating the RBF coop close feature and running the production
+// constructor, so a test retires the same object the peer would.
+func initTestRbfCloser(t *testing.T, p *Brontide,
+	channel *lnwallet.LightningChannel) *chancloser.RbfChanCloser {
+
+	// Both sides must signal the feature for the RBF closer to be used
+	// for this channel, just as a negotiated peer connection would.
+	rbfBits := lnwire.NewRawFeatureVector(lnwire.RbfCoopCloseOptional)
+	p.cfg.Features = lnwire.NewFeatureVector(rbfBits, lnwire.Features)
+	p.remoteFeatures = lnwire.NewFeatureVector(rbfBits, lnwire.Features)
+	require.True(t, p.rbfCoopCloseAllowed(channel.ChanType()))
+
+	closer, err := p.initRbfChanCloser(channel)
+	require.NoError(t, err)
+	require.NotNil(t, closer)
+
+	return closer
+}
+
+// routeMsg sends a message through the peer's router, which is the path an
+// incoming wire message takes to reach a registered closer.
+func routeMsg(t *testing.T, p *Brontide, msg msgmux.PeerMsg) error {
+	t.Helper()
+
+	var err error
+	p.msgRouter.WhenSome(func(r msgmux.Router) {
+		err = r.RouteMsg(msg)
+	})
+
+	return err
+}
+
+// TestRetireChanCloserIsIdempotent checks that retiring a closer twice
+// leaves the second call with nothing to do, so a close that already
+// reported its own outcome is not reported a second time.
+func TestRetireChanCloserIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	harness, err := createTestPeerWithChannel(t, noUpdate)
+	require.NoError(t, err)
+
+	alicePeer := harness.peer
+	chanPoint := harness.channel.ChannelPoint()
+	chanID := lnwire.NewChanIDFromOutPoint(chanPoint)
+
+	// A waiting caller is only answered once, no matter how many paths
+	// race to end the close. The request carries room for one outcome, so
+	// a second report would block until the peer went away.
+	closeReq := &htlcswitch.ChanClose{
+		ChanPoint: &chanPoint,
+		Updates:   make(chan interface{}, 1),
+		Err:       make(chan error, 1),
+	}
+	alicePeer.activeCloseReqs.add(chanID, closeReq)
+
+	alicePeer.deleteActiveChanCloser(chanID, chanPoint)
+	alicePeer.deleteActiveChanCloser(chanID, chanPoint)
+
+	select {
+	case err := <-closeReq.Err:
+		require.ErrorIs(t, err, ErrCoopCloseAbortedByLinkFailure)
+
+	case <-time.After(timeout):
+		t.Fatal("caller was not told the close ended")
+	}
+
+	// A second outcome must not follow the first.
+	select {
+	case err := <-closeReq.Err:
+		t.Fatalf("caller was told twice: %v", err)
+
+	case <-time.After(shortTimeout):
+	}
+}
+
+// TestCloseReqClaimedExactlyOnce checks that a caller waiting on a
+// cooperative close can be claimed by exactly one path, which is what keeps a
+// close from being reported twice. A close that already finished reports
+// success through the claimed record; a retirement that claims it first must
+// make that report impossible rather than have both land.
+func TestCloseReqClaimedExactlyOnce(t *testing.T) {
+	t.Parallel()
+
+	harness, err := createTestPeerWithChannel(t, noUpdate)
+	require.NoError(t, err)
+
+	alicePeer := harness.peer
+	chanPoint := harness.channel.ChannelPoint()
+	chanID := lnwire.NewChanIDFromOutPoint(chanPoint)
+
+	closeReq := &htlcswitch.ChanClose{
+		ChanPoint: &chanPoint,
+		Updates:   make(chan interface{}, 1),
+		Err:       make(chan error, 1),
+	}
+	alicePeer.activeCloseReqs.add(chanID, closeReq)
+
+	// A retirement claims the caller first, so the close that finished has
+	// nothing left to report to and must not send its success update.
+	alicePeer.deleteActiveChanCloser(chanID, chanPoint)
+
+	// The retirement took the caller's record, so a close that finished has
+	// nothing left to report to.
+	require.Nil(t, alicePeer.activeCloseReqs.peek(chanID))
+
+	select {
+	case err := <-closeReq.Err:
+		require.ErrorIs(t, err, ErrCoopCloseAbortedByLinkFailure)
+
+	case <-time.After(timeout):
+		t.Fatal("retirement did not tell the caller the close ended")
+	}
+
+	select {
+	case update := <-closeReq.Updates:
+		t.Fatalf("close reported a second outcome: %v", update)
+
+	case <-time.After(shortTimeout):
+	}
+}
+
 // TestPeerChannelClosureAcceptFeeInitiator tests the shutdown initiator's
 // behavior if we can agree on the fee immediately.
 func TestPeerChannelClosureAcceptFeeInitiator(t *testing.T) {
